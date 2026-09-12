@@ -1,5 +1,7 @@
 # dll-proxy-gen
 
+![dll-proxy-gen: PE export forwarding generator](assets/project-mark.svg)
+
 A command-line tool that reads the export table of any Windows DLL and
 generates ready-to-compile C source, a `.def` module-definition file, and an
 optional `CMakeLists.txt` for building a **proxy DLL** that forwards every
@@ -210,3 +212,7 @@ dll-proxy-gen/
 ## License
 
 MIT — see source headers.
+
+## License and maintenance
+
+Maintained by [unrandoms](https://github.com/unrandoms). Distributed under the [MIT License](LICENSE).

@@ -1,218 +1,59 @@
-# dll-proxy-gen
+# pe-linkmap
 
-![dll-proxy-gen: PE export forwarding generator](assets/project-mark.svg)
+![pe-linkmap: inspect and compare DLL exports](assets/project-mark.svg)
 
-A command-line tool that reads the export table of any Windows DLL and
-generates ready-to-compile C source, a `.def` module-definition file, and an
-optional `CMakeLists.txt` for building a **proxy DLL** that forwards every
-call to the original while executing a payload on load.
+Compare the exported interface of two Windows DLL releases without loading or executing either binary. Use the JSON report in CI, or attach the Markdown report to a release review.
 
-> **Legal notice** — This tool is intended exclusively for authorised security
-> testing, red-team exercises, and academic research on systems you own or have
-> written permission to test.  Misuse against systems without authorisation
-> is illegal.  The authors accept no liability for unlawful use.
+## Install from this checkout
 
----
+Requires Python 3.10 or newer. No published package is required.
 
-## What is DLL proxying?
-
-Windows resolves DLL imports by searching a set of directories in a fixed
-order (the *DLL search order*).  If an application loads `version.dll`
-without a full path, Windows looks in the application directory first.
-Placing a crafted `version.dll` there — one that loads the real DLL and
-forwards all calls — lets an attacker or red-teamer run arbitrary code in the
-application's process.
-
-### When it applies
-
-| Condition | Detail |
-|-----------|--------|
-| DLL not in `KnownDLLs` | `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs` lists DLLs always loaded from `System32`; these cannot be hijacked via the search order. |
-| Application directory writable | The attacker must be able to place a file next to the `.exe`. |
-| Manifest / side-by-side absent | WinSxS assemblies ignore the normal search order. |
-
-Common hijackable targets: **version.dll**, **winmm.dll**, **dwmapi.dll**,
-**uxtheme.dll**, **wtsapi32.dll**.
-
----
-
-## Installation
-
-```bash
-pip install dll-proxy-gen          # from PyPI (once released)
-# or directly from source
-pip install .
+```sh
+python -m pip install .
+pe-linkmap --help
 ```
 
-Optional dependency for faster/more robust PE parsing:
+If upgrading an environment with the old distribution installed, run `python -m pip uninstall dll-proxy-gen` first to avoid overlapping package files.
 
-```bash
-pip install "dll-proxy-gen[pefile]"
+## Capture and compare
+
+```sh
+pe-linkmap inspect before.dll -o before.json
+pe-linkmap inspect after.dll -o after.json
+pe-linkmap diff before.json after.json --snapshots --format markdown -o changes.md
+pe-linkmap diff before.dll after.dll --fail-on-breaking
 ```
 
-The tool ships a pure-Python PE parser and falls back to it when `pefile` is
-not installed.
+Snapshots contain the SHA-256 of the exact bytes inspected, machine type, export names, ordinals, RVAs and forwarding targets. Names sharing an ordinal and ordinal-only exports are preserved. JSON output has stable key and export ordering.
 
----
+| Change | Result |
+| --- | --- |
+| Removed name or ordinal | Structural break |
+| Existing name moved to another ordinal | Structural break |
+| Machine type changed | Structural break |
+| Forwarding target changed | Review required |
+| Added export | Reported, no structural break |
+| RVA changed | Not treated as an interface break |
 
-## Usage
+Exit codes: `0` for a successful report; `1` for a structural break when `--fail-on-breaking` is set; `2` for invalid input or an I/O error. A report is still written before exit code `1`.
 
-### List exports only
+## Scope and limits
 
-```bash
-dll-proxy-gen --list-exports version.dll
+This is an export-surface check, not a complete ABI compatibility verdict. It cannot establish parameter types, calling conventions, behavior, or whether an export is code or data. An unchanged export list does not prove compatibility. Forwarding changes require human review even when CI exits successfully.
+
+The static parser supports PE32 and PE32+ files with an export directory. Inputs are limited to 64 MiB; malformed, unsupported or exportless files are rejected. Snapshots use schema version 1 and are validated before comparison. No network service or Windows installation is required.
+
+## Development
+
+```sh
+python -m pip install '.[dev]'
+python -m pytest -q
 ```
 
-```
-DLL name  : version.dll
-Ordinal base: 1
-Total exports: 17
-  Named       : 17
-  Ordinal-only: 0
+Tests cover aliases, ordinal-only exports, forwarded exports, malformed input, snapshot validation, comparison behavior and CLI exit codes. Fixtures are generated as bytes; tests do not execute DLLs.
 
- Ordinal         RVA  Name
--------------------------------------------
-       1  0x000015a0  GetFileVersionInfoA
-       2  0x00001670  GetFileVersionInfoExA
-       ...
-```
+## History and credits
 
-### Generate a proxy with no payload
+Maintained by [unrandoms](https://github.com/unrandoms), under the [MIT License](LICENSE).
 
-```bash
-dll-proxy-gen --target version.dll --output ./proxy/
-```
-
-### Generate a proxy that shows a MessageBox on load
-
-```bash
-dll-proxy-gen --target winmm.dll --output ./winmm_proxy/ --payload messagebox
-```
-
-### Generate a proxy that runs shellcode from a binary file
-
-```bash
-dll-proxy-gen --target dwmapi.dll --output ./dwmapi_proxy/ \
-              --payload shellcode --shellcode-file calc.bin
-```
-
-### Skip CMakeLists.txt
-
-```bash
-dll-proxy-gen --target version.dll --output ./proxy/ --no-cmake
-```
-
----
-
-## Generated files
-
-| File | Purpose |
-|------|---------|
-| `proxy.c` | C source with `DllMain` and `#pragma comment(linker, "/export:...")` forwarding stubs |
-| `proxy.def` | Module-definition file for explicit linker control |
-| `CMakeLists.txt` | CMake build script for MSVC or MinGW |
-| `shellcode.h` | *(shellcode payload only)* embedded byte array |
-
----
-
-## Compiling the proxy
-
-### MSVC (x64, Visual Studio command prompt)
-
-```cmd
-cl /LD /Fe:version.dll proxy.c /DEF:proxy.def
-```
-
-Or with CMake:
-
-```cmd
-cmake -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-```
-
-### MinGW-w64 (cross-compile from Linux or native Windows)
-
-```bash
-x86_64-w64-mingw32-gcc -shared -o version.dll proxy.c -Wl,--kill-at
-```
-
-Or with CMake:
-
-```bash
-cmake -B build -G "MinGW Makefiles" \
-      -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-      -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
----
-
-## Deployment steps
-
-1. **Rename** the real `version.dll` to `_version_orig.dll` (the forwarding
-   stubs reference this name).
-2. **Place** your compiled `version.dll` and `_version_orig.dll` in the
-   application directory.
-3. **Launch** the target application; Windows loads your proxy, which loads
-   the original and forwards all calls.
-
----
-
-## Payload options
-
-| `--payload` | Effect |
-|-------------|--------|
-| `none` (default) | Pure forwarding proxy — no extra code runs |
-| `messagebox` | Calls `MessageBoxA` on load — useful for PoC verification |
-| `shellcode` | Allocates RWX memory, copies shellcode bytes from `shellcode.h`, and executes in a new thread |
-| `loadlib` | Calls `LoadLibraryA("payload.dll")` — load a separate stage |
-
----
-
-## PE parser notes
-
-`parser.py` reads the PE structure manually using Python's `struct` module:
-
-1. DOS header (`MZ` magic, `e_lfanew`)
-2. `IMAGE_NT_HEADERS` (PE signature + `IMAGE_FILE_HEADER`)
-3. `IMAGE_OPTIONAL_HEADER` — both PE32 and PE32+ (64-bit) are supported
-4. Section table — used to convert RVAs to file offsets
-5. `IMAGE_EXPORT_DIRECTORY` — walks `AddressOfFunctions`,
-   `AddressOfNames`, and `AddressOfNameOrdinals` to reconstruct named and
-   ordinal-only exports
-
-If `pefile` is installed (`pip install pefile`) it is used instead (faster,
-handles edge cases in malformed headers).
-
----
-
-## Project layout
-
-```
-dll-proxy-gen/
-  dll_proxy_gen/
-    __init__.py
-    parser.py      # PE export table parser
-    generator.py   # Jinja2-backed code generation
-    payload.py     # payload snippet registry
-    cli.py         # argparse CLI entry point
-  templates/
-    proxy.c.j2
-    proxy.def.j2
-    CMakeLists.txt.j2
-  tests/
-    test_parser.py
-    test_generator.py
-  pyproject.toml
-  README.md
-```
-
----
-
-## License
-
-MIT — see source headers.
-
-## License and maintenance
-
-Maintained by [unrandoms](https://github.com/unrandoms). Distributed under the [MIT License](LICENSE).
+This project evolved from this repository's `dll-proxy-gen` implementation. Its parser and existing history remain; the new `pe_linkmap` package adds release inspection, snapshots and comparison. The legacy `dll-proxy-gen` command remains for compatibility and is not the interface described above. Renaming the project does not change authorship of existing commits or third-party components.

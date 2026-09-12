@@ -26,11 +26,12 @@ class Export:
     ordinal: int
     name: Optional[str]   # None for ordinal-only exports
     rva: int              # Relative Virtual Address of the function
+    forwarder: Optional[str] = None
 
     @property
     def forwarded(self) -> bool:
         """True when the export is a forwarder (RVA inside the export section)."""
-        return False  # resolved by the parser; stored inline here
+        return self.forwarder is not None
 
     def __repr__(self) -> str:
         label = self.name or f"@{self.ordinal}"
@@ -44,6 +45,7 @@ class PEExports:
     dll_name: str                  # internal name from the export directory
     base: int                      # ordinal base
     exports: List[Export] = field(default_factory=list)
+    machine: int = 0
 
     @property
     def named(self) -> List[Export]:
@@ -74,10 +76,12 @@ def _parse_with_pefile(path: Path) -> PEExports:
     exports: List[Export] = []
     for sym in exp_dir.symbols:
         name: Optional[str] = sym.name.decode("ascii", errors="replace") if sym.name else None
-        exports.append(Export(ordinal=sym.ordinal, name=name, rva=sym.address or 0))
+        exports.append(Export(ordinal=sym.ordinal, name=name, rva=sym.address or 0,
+                              forwarder=sym.forwarder.decode("ascii", errors="replace") if sym.forwarder else None))
 
+    machine = pe.FILE_HEADER.Machine
     pe.close()
-    return PEExports(dll_name=dll_name, base=base, exports=exports)
+    return PEExports(dll_name=dll_name, base=base, exports=exports, machine=machine)
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +119,7 @@ _FMT_EXPORT_DIRECTORY = "<IIHHIIIIII"
 def _rva_to_offset(rva: int, sections: list) -> int:
     """Convert a Relative Virtual Address to a file offset using the section table."""
     for va, raw_off, raw_size, virt_size in sections:
-        size = virt_size if virt_size else raw_size
+        size = min(virt_size, raw_size) if virt_size else raw_size
         if va <= rva < va + size:
             return raw_off + (rva - va)
     raise ValueError(f"RVA 0x{rva:08x} not mapped by any section")
@@ -128,7 +132,18 @@ def _read_sz(data: bytes, offset: int) -> str:
 
 
 def _parse_pure_python(path: Path) -> PEExports:
-    data = path.read_bytes()
+    return parse_export_bytes(path.read_bytes(), path.name)
+
+
+def parse_export_bytes(data: bytes, filename: str = "input") -> PEExports:
+    """Parse a byte snapshot so a report hashes exactly the bytes it inspected."""
+    try:
+        return _parse_data(data, Path(filename))
+    except (struct.error, IndexError) as exc:
+        raise ValueError(f"{filename!r}: truncated PE structure") from exc
+
+
+def _parse_data(data: bytes, path: Path) -> PEExports:
 
     # 1. DOS header
     if data[:2] != _MZ:
@@ -187,16 +202,18 @@ def _parse_pure_python(path: Path) -> PEExports:
 
     # 6. Walk tables
     fn_table_off    = _rva_to_offset(addr_of_functions_rva, sections)
-    name_table_off  = _rva_to_offset(addr_of_names_rva, sections)
-    ord_table_off   = _rva_to_offset(addr_of_name_ordinals_rva, sections)
+    name_table_off = _rva_to_offset(addr_of_names_rva, sections) if num_names else 0
+    ord_table_off = _rva_to_offset(addr_of_name_ordinals_rva, sections) if num_names else 0
 
     # Build ordinal -> name map from the name/ordinal parallel arrays
-    ordinal_to_name: dict[int, str] = {}
+    ordinal_to_names: dict[int, list[str]] = {}
     for i in range(num_names):
         name_rva_i  = struct.unpack_from("<I", data, name_table_off + i * 4)[0]
         hint_ord    = struct.unpack_from("<H", data, ord_table_off + i * 2)[0]
         symbol_name = _read_sz(data, _rva_to_offset(name_rva_i, sections))
-        ordinal_to_name[hint_ord] = symbol_name
+        if hint_ord >= num_functions:
+            raise ValueError("Export name ordinal exceeds the address table")
+        ordinal_to_names.setdefault(hint_ord, []).append(symbol_name)
 
     # Export address table: index 0 → ordinal base, index i → ordinal (base + i)
     exports: List[Export] = []
@@ -205,10 +222,13 @@ def _parse_pure_python(path: Path) -> PEExports:
         if fn_rva == 0:
             continue  # gap in the export table
         ordinal = base + i
-        name: Optional[str] = ordinal_to_name.get(i)  # hint is 0-based index
-        exports.append(Export(ordinal=ordinal, name=name, rva=fn_rva))
+        forwarder = None
+        if exp_rva <= fn_rva < exp_rva + exp_size:
+            forwarder = _read_sz(data, _rva_to_offset(fn_rva, sections))
+        for name in ordinal_to_names.get(i, [None]):
+            exports.append(Export(ordinal=ordinal, name=name, rva=fn_rva, forwarder=forwarder))
 
-    return PEExports(dll_name=dll_name, base=base, exports=exports)
+    return PEExports(dll_name=dll_name, base=base, exports=exports, machine=machine)
 
 
 # ---------------------------------------------------------------------------
